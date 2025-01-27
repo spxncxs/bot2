@@ -1,0 +1,248 @@
+import json
+import requests
+import pandas as pd
+from sqlalchemy import create_engine, Table, Column, Float, String, Boolean, MetaData, DateTime
+from datetime import datetime
+from sklearn.ensemble import IsolationForest
+import numpy as np
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
+from apscheduler.schedulers.blocking import BlockingScheduler
+
+# Load config file
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+# Extract config values
+DEXSCREENER_API_URL = config["dexscreeener_api_url"]
+POCKET_UNIVERSE_API_URL = config["pocket_universe_api_url"]
+POCKET_UNIVERSE_API_KEY = config["pocket_universe_api_key"]
+RUGCHECK_API_URL = config["rugcheck_api_url"]
+RUGCHECK_API_KEY = config["rugcheck_api_key"]
+BONKBOT_API_URL = config["bonkbot_api_url"]
+BONKBOT_API_KEY = config["bonkbot_api_key"]
+DATABASE_URI = config["database_uri"]
+TELEGRAM_BOT_TOKEN = config["telegram_bot_token"]
+TELEGRAM_CHAT_ID = config["telegram_chat_id"]
+FILTERS = config["filters"]
+BLACKLIST = config["blacklist"]
+
+# Database setup
+engine = create_engine(DATABASE_URI)
+metadata = MetaData()
+
+# Define table schema
+tokens_table = Table(
+    "tokens",
+    metadata,
+    Column("token_address", String, primary_key=True),
+    Column("name", String),
+    Column("price", Float),
+    Column("liquidity", Float),
+    Column("volume", Float),
+    Column("market_cap", Float),
+    Column("dev_address", String),
+    Column("is_fake_volume", Boolean, default=False),
+    Column("is_bundled_supply", Boolean, default=False),
+    Column("rugcheck_status", String),
+    Column("timestamp", DateTime, default=datetime.utcnow),
+)
+
+# Create table if it doesn't exist
+metadata.create_all(engine)
+
+# Initialize Telegram bot
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+def fetch_token_data(token_address):
+    """Fetch token data from DexScreener."""
+    response = requests.get(f"{DEXSCREENER_API_URL}{token_address}")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to fetch data for token: {token_address}")
+        return None
+
+def is_blacklisted(token_data):
+    """Check if the token or dev is blacklisted."""
+    token_address = token_data["address"]
+    dev_address = token_data["devAddress"]
+
+    if token_address in BLACKLIST["coins"]:
+        return True
+    if dev_address in BLACKLIST["devs"]:
+        return True
+    return False
+
+def passes_filters(token_data):
+    """Check if the token passes the liquidity and volume filters."""
+    liquidity = token_data["liquidity"]
+    volume = token_data["volume"]
+
+    if not (FILTERS["min_liquidity"] <= liquidity <= FILTERS["max_liquidity"]):
+        return False
+    if not (FILTERS["min_volume"] <= volume <= FILTERS["max_volume"]):
+        return False
+    return True
+
+def check_fake_volume(token_address):
+    """Check if the token has fake volume using Pocket Universe API."""
+    headers = {
+        "Authorization": f"Bearer {POCKET_UNIVERSE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "token_address": token_address,
+        "analysis_type": "fake_volume",
+    }
+    response = requests.post(POCKET_UNIVERSE_API_URL, headers=headers, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        return result.get("is_fake_volume", False)
+    else:
+        print(f"Failed to check fake volume for token: {token_address}")
+        return False
+
+def check_rugcheck_status(token_address):
+    """Check if the token is marked as 'Good' on rugcheck.xyz."""
+    headers = {
+        "Authorization": f"Bearer {RUGCHECK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    response = requests.get(f"{RUGCHECK_API_URL}/{token_address}", headers=headers)
+    if response.status_code == 200:
+        result = response.json()
+        return result.get("status", "Unknown")
+    else:
+        print(f"Failed to check rugcheck status for token: {token_address}")
+        return "Unknown"
+
+def check_bundled_supply(token_data):
+    """Check if the token's supply is bundled."""
+    holders = token_data.get("holders", [])
+    if not holders:
+        return False
+
+    total_supply = token_data["totalSupply"]
+    top_holder_percentage = sum(h["balance"] for h in holders[:5]) / total_supply * 100
+    return top_holder_percentage > 90  # Example threshold
+
+def save_token_data(token_data, is_fake_volume=False, is_bundled_supply=False, rugcheck_status="Unknown"):
+    """Save token data to the database."""
+    with engine.connect() as conn:
+        conn.execute(
+            tokens_table.insert(),
+            {
+                "token_address": token_data["address"],
+                "name": token_data["name"],
+                "price": token_data["price"],
+                "liquidity": token_data["liquidity"],
+                "volume": token_data["volume"],
+                "market_cap": token_data["marketCap"],
+                "dev_address": token_data["devAddress"],
+                "is_fake_volume": is_fake_volume,
+                "is_bundled_supply": is_bundled_supply,
+                "rugcheck_status": rugcheck_status,
+            },
+        )
+
+def detect_anomalies(prices):
+    """Detect price anomalies using Isolation Forest."""
+    model = IsolationForest(contamination=0.1)
+    prices = np.array(prices).reshape(-1, 1)
+    anomalies = model.fit_predict(prices)
+    return anomalies
+
+def send_telegram_alert(message):
+    """Send an alert via Telegram."""
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+
+def update_blacklist(token_address, dev_address):
+    """Update the blacklist with a new token and dev."""
+    BLACKLIST["coins"].append(token_address)
+    BLACKLIST["devs"].append(dev_address)
+    with open("config.json", "w") as f:
+        json.dump(config, f, indent=4)
+
+def trade_with_bonkbot(token_address, action):
+    """Execute a trade using BonkBot."""
+    headers = {
+        "Authorization": f"Bearer {BONKBOT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "token_address": token_address,
+        "action": action,  # "buy" or "sell"
+    }
+    response = requests.post(BONKBOT_API_URL, headers=headers, json=payload)
+    if response.status_code == 200:
+        return True
+    else:
+        print(f"Failed to execute {action} for token: {token_address}")
+        return False
+
+def run_bot():
+    """Fetch, analyze, and alert."""
+    token_address = "0xYourTokenAddressHere"  # Replace with actual token address
+    token_data = fetch_token_data(token_address)
+    if token_data:
+        token_data = token_data["pairs"][0]
+
+        # Check blacklist and filters
+        if is_blacklisted(token_data):
+            print(f"Token {token_data['name']} is blacklisted. Skipping.")
+            return
+        if not passes_filters(token_data):
+            print(f"Token {token_data['name']} does not pass filters. Skipping.")
+            return
+
+        # Check rugcheck status
+        if FILTERS["require_rugcheck_good"]:
+            rugcheck_status = check_rugcheck_status(token_data["address"])
+            if rugcheck_status != "Good":
+                print(f"Token {token_data['name']} is not marked as 'Good' on rugcheck.xyz. Skipping.")
+                return
+
+        # Check for fake volume
+        if FILTERS["skip_fake_volume"]:
+            is_fake_volume = check_fake_volume(token_data["address"])
+            if is_fake_volume:
+                print(f"Token {token_data['name']} has fake volume. Skipping.")
+                return
+
+        # Check for bundled supply
+        if FILTERS["check_bundled_supply"]:
+            is_bundled_supply = check_bundled_supply(token_data)
+            if is_bundled_supply:
+                print(f"Token {token_data['name']} has bundled supply. Blacklisting token and dev.")
+                update_blacklist(token_data["address"], token_data["devAddress"])
+                return
+
+        # Save and analyze data
+        save_token_data(
+            token_data,
+            is_fake_volume=is_fake_volume,
+            is_bundled_supply=is_bundled_supply,
+            rugcheck_status=rugcheck_status,
+        )
+        historical_prices = [100, 101, 102, 150, 103, 104, 105]  # Replace with actual data
+        anomalies = detect_anomalies(historical_prices)
+        if anomalies.any():
+            send_telegram_alert(f"🚨 Anomaly detected in token {token_data['name']}!")
+            if trade_with_bonkbot(token_data["address"], "buy"):
+                send_telegram_alert(f"✅ Successfully bought {token_data['name']}!")
+
+# Schedule the bot to run every 5 minutes
+scheduler = BlockingScheduler()
+scheduler.add_job(run_bot, "interval", minutes=5)
+scheduler.start()
+
+# Telegram command handlers
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("🚀 Crypto Trading Bot is running!")
+
+# Initialize Telegram updater
+updater = Updater(TELEGRAM_BOT_TOKEN)
+updater.dispatcher.add_handler(CommandHandler("start", start))
+updater.start_polling()
+updater.idle()
